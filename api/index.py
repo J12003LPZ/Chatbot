@@ -13,6 +13,9 @@ import base64
 from PIL import Image
 import io
 from dotenv import load_dotenv
+import cloudinary
+import cloudinary.uploader
+import cloudinary.api
 # Import database manager
 try:
     from database import DatabaseManager
@@ -21,6 +24,14 @@ except ImportError:
 
 # Load environment variables
 load_dotenv()
+
+# Configure Cloudinary
+cloudinary.config(
+    cloud_name=os.getenv('CLOUDINARY_CLOUD_NAME'),
+    api_key=os.getenv('CLOUDINARY_API_KEY'),
+    api_secret=os.getenv('CLOUDINARY_API_SECRET'),
+    secure=True
+)
 
 app = Flask(__name__, static_folder='../static', template_folder='../templates')
 app.secret_key = os.getenv('SECRET_KEY', 'your-secret-key-here')
@@ -47,59 +58,38 @@ else:
     logger.error("OPENROUTER_API_KEY not found in environment variables")
 
 # Configuration
-UPLOAD_FOLDER = 'uploads'
 ALLOWED_EXTENSIONS = {'pdf', 'png', 'jpg', 'jpeg', 'gif', 'txt'}
 MAX_FILE_SIZE = 16 * 1024 * 1024  # 16MB
-
-# Ensure upload directory exists
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
-def extract_text_from_pdf(file_path):
-    """Extract text from PDF file"""
+def extract_text_from_pdf(file_stream):
+    """Extract text from PDF file stream"""
     try:
-        with open(file_path, 'rb') as file:
-            pdf_reader = PyPDF2.PdfReader(file)
-            text = ""
-            for page in pdf_reader.pages:
-                text += page.extract_text() + "\n"
+        pdf_reader = PyPDF2.PdfReader(file_stream)
+        text = ""
+        for page in pdf_reader.pages:
+            text += page.extract_text() + "\n"
         return text
     except Exception as e:
         logger.error(f"Error extracting PDF text: {e}")
         return None
 
-def process_image(file_path):
-    """Process image file for Gemma 3n multimodal input"""
+def process_image_stream(file_stream):
+    """Process image file stream for multimodal input"""
     try:
-        with Image.open(file_path) as img:
-            # Gemma 3n works with specific resolutions: 256x256, 512x512, or 768x768
-            # Choose the best fit
-            max_dim = max(img.width, img.height)
-            if max_dim <= 256:
-                target_size = (256, 256)
-            elif max_dim <= 512:
-                target_size = (512, 512)
-            else:
-                target_size = (768, 768)
-            
-            # Resize to target resolution while maintaining aspect ratio
-            img.thumbnail(target_size, Image.Resampling.LANCZOS)
-            
-            # Create a new image with the exact target size and paste the resized image
-            new_img = Image.new('RGB', target_size, (255, 255, 255))
-            
-            # Center the image
-            x = (target_size[0] - img.width) // 2
-            y = (target_size[1] - img.height) // 2
-            new_img.paste(img, (x, y))
-            
-            # Convert to base64
-            buffer = io.BytesIO()
-            new_img.save(buffer, format='JPEG', quality=90)
-            img_str = base64.b64encode(buffer.getvalue()).decode()
-            return img_str, target_size
+        img = Image.open(file_stream)
+        
+        # Convert to base64 for API
+        buffer = io.BytesIO()
+        # Convert to RGB if necessary
+        if img.mode in ('RGBA', 'LA', 'P'):
+            img = img.convert('RGB')
+        img.save(buffer, format='JPEG', quality=90)
+        img_str = base64.b64encode(buffer.getvalue()).decode()
+        
+        return img_str, (img.width, img.height)
             
     except Exception as e:
         logger.error(f"Error processing image: {e}")
@@ -311,17 +301,11 @@ def upload_file():
         if file_size > MAX_FILE_SIZE:
             return jsonify({'error': 'File too large'}), 400
         
-        # Save file
-        filename = secure_filename(file.filename)
-        timestamp = int(time.time())
-        filename = f"{timestamp}_{filename}"
-        file_path = os.path.join(UPLOAD_FOLDER, filename)
-        file.save(file_path)
-        
         # Process file based on type
-        file_extension = filename.rsplit('.', 1)[1].lower()
+        file_extension = file.filename.rsplit('.', 1)[1].lower()
         processed_content = None
         image_data = None
+        cloudinary_url = None
         
         # Create session if it doesn't exist
         existing_messages = get_messages_with_fallback(session_id)
@@ -329,17 +313,35 @@ def upload_file():
             session_id = create_session_with_fallback(session_id)
         
         if file_extension == 'pdf':
-            processed_content = extract_text_from_pdf(file_path)
+            processed_content = extract_text_from_pdf(file)
             if processed_content:
+                # Upload PDF to Cloudinary for storage
+                try:
+                    result = cloudinary.uploader.upload(file, resource_type="raw", folder="chatbot/pdfs")
+                    cloudinary_url = result.get('secure_url')
+                except Exception as e:
+                    logger.error(f"Error uploading PDF to Cloudinary: {e}")
+                
                 # Add file content to chat session
                 content = f"User uploaded a PDF file '{file.filename}'. Content:\n\n{processed_content[:2000]}{'...' if len(processed_content) > 2000 else ''}"
                 save_message_with_fallback(session_id, 'system', content)
         
         elif file_extension in ['png', 'jpg', 'jpeg', 'gif']:
-            image_data, target_size = process_image(file_path)
+            # Process image for API
+            file.seek(0)  # Reset file pointer
+            image_data, image_size = process_image_stream(file)
+            
             if image_data:
+                # Upload original image to Cloudinary
+                try:
+                    file.seek(0)  # Reset file pointer again
+                    result = cloudinary.uploader.upload(file, folder="chatbot/images")
+                    cloudinary_url = result.get('secure_url')
+                except Exception as e:
+                    logger.error(f"Error uploading image to Cloudinary: {e}")
+                
                 # Store image data for potential use in chat
-                content = f"User uploaded an image file '{file.filename}' (processed to {target_size[0]}x{target_size[1]}). The image has been processed and is ready for analysis."
+                content = f"User uploaded an image file '{file.filename}' ({image_size[0]}x{image_size[1]}). The image has been processed and is ready for analysis."
                 save_message_with_fallback(session_id, 'system', content)
                 
                 # Return image data for immediate use in frontend
@@ -349,27 +351,30 @@ def upload_file():
                     'session_id': session_id,
                     'message': f'Image "{file.filename}" uploaded and processed successfully',
                     'image_data': image_data,
-                    'image_size': target_size
+                    'image_size': image_size,
+                    'cloudinary_url': cloudinary_url
                 })
         
         elif file_extension == 'txt':
-            with open(file_path, 'r', encoding='utf-8') as f:
-                text_content = f.read()
+            text_content = file.read().decode('utf-8')
+            
+            # Upload text file to Cloudinary
+            try:
+                file.seek(0)
+                result = cloudinary.uploader.upload(file, resource_type="raw", folder="chatbot/texts")
+                cloudinary_url = result.get('secure_url')
+            except Exception as e:
+                logger.error(f"Error uploading text file to Cloudinary: {e}")
             
             content = f"User uploaded a text file '{file.filename}'. Content:\n\n{text_content[:2000]}{'...' if len(text_content) > 2000 else ''}"
             save_message_with_fallback(session_id, 'system', content)
-        
-        # Clean up uploaded file after processing
-        try:
-            os.remove(file_path)
-        except:
-            pass
         
         return jsonify({
             'success': True,
             'filename': file.filename,
             'session_id': session_id,
-            'message': f'File "{file.filename}" uploaded and processed successfully'
+            'message': f'File "{file.filename}" uploaded and processed successfully',
+            'cloudinary_url': cloudinary_url
         })
         
     except Exception as e:
