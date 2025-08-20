@@ -15,10 +15,5 @@
       "src": "/(.*)",
       "dest": "api/index.py"
     }
-  ],
-  "env": {
-    "OPENROUTER_API_KEY": "@openrouter_api_key",
-    "SECRET_KEY": "@secret_key",
-    "DATABASE_URL": "@database_url"
-  }
+  ]
 }
